@@ -1,0 +1,161 @@
+# Permanent freezing of unclaimed rewards after a veYFI lock expires and is re-locked (both veYFI Reward Pools)
+
+**Severity:** High — *Permanent freezing of unclaimed yield*
+**Assets in scope (both affected, identical `_claim` bug):**
+- dYFI Reward Pool — `0x2391Fc8f5E417526338F5aa3968b1851C16D894E` (actively funded; primary impact)
+- YFI Reward Pool — `0xb287a1964aee422911c7b8409f5e5a273c1412fa` (veYFI's `reward_pool()`; holds YFI penalties)
+
+**Related contracts:** veYFI `0x90c1f9220d90d3966FbeE24045EDd73E1d588aD5`, dYFI `0x41252E8691e964f7de35156B68493bAb6797a275`
+
+---
+
+## Brief / Intro
+
+Both veYFI Reward Pools use the same `_claim`, which breaks out of its week-iteration loop on the **first week a user's veYFI balance is zero**, without advancing that user's stored week cursor. A fully expired veYFI lock has a zero balance, so the cursor becomes permanently trapped on the expiry week. If the user later **re-locks** — the ordinary, economically rational way to re-enter after exiting — every reward accrued from that point on is unreachable forever, because each subsequent `claim()` re-enters the loop at the same zero week and immediately breaks. In production this permanently freezes the unclaimed rewards of any veYFI holder who lets a lock expire and later locks again; the stranded rewards are never redistributed and are unrecoverable, as both contracts are immutable with no admin and no way to reset the cursor. Multiple addresses are already frozen on mainnet today, in both pools.
+
+---
+
+## Vulnerability Details
+
+The Reward Pools stream rewards to veYFI lockers, tracking how far each user has claimed with `time_cursor_of[addr]`. The defect is in `_claim`, identical in both deployed pools:
+
+```vyper
+for i in range(50):
+    if week_cursor >= last_token_time:
+        break
+    balance_of: uint256 = VEYFI.balanceOf(addr, week_cursor)
+    if balance_of == 0:
+        break                              # (A) terminate on ANY zero-balance week …
+    to_distribute += balance_of * self.tokens_per_week[week_cursor] / self.ve_supply[week_cursor]
+    week_cursor += WEEK                     # (B) … the increment is AFTER the break, so it never runs for that week
+self.time_cursor_of[addr] = week_cursor     # (C) the zero week is persisted as the new cursor
+```
+
+Because the `week_cursor += WEEK` at `(B)` is unreachable once `balance_of == 0`, the cursor saved at `(C)` is the zero week itself. On the next call the loop reads the same zero balance and breaks again — the cursor can never move past it. **No admin or user function in either contract can reset or advance `time_cursor_of`**, so the state is terminal.
+
+`veYFI.balanceOf(addr, ts)` behaves correctly — it returns `0` during the gap between an expired lock and a re-lock, and a positive value again afterwards. The contract reads correct data; the defect is solely the control flow that treats a transient zero week as the end of the user's history.
+
+### Why this is a bug, not intended behaviour
+
+The intended behaviour is to **skip** a zero-balance week and keep iterating, so that a lock which expires and is later re-created still receives its later fees. The upstream **Curve `FeeDistributor`** (the contract these pools fork) does exactly that — it breaks only when the balance is zero *and there are no more lock points*, otherwise it advances the cursor past the zero week:
+
+```vyper
+# Curve FeeDistributor._claim (reference)
+if balance_of == 0 and user_epoch > max_user_epoch:   # break ONLY when no lock points remain
+    break
+if balance_of > 0:
+    to_distribute += balance_of * self.tokens_per_week[week_cursor] / self.ve_supply[week_cursor]
+week_cursor += WEEK                                    # a zero week is SKIPPED; the cursor still advances
+```
+
+Yearn's pools dropped the `and user_epoch > max_user_epoch` condition and replaced Curve's point-walking with a direct `veYFI.balanceOf` call, turning a benign "skip empty week" into a permanent stop. There is no NatSpec, code comment, or documentation stating that letting a lock expire forfeits future rewards; the on-chain victims confirm the loss is real and unintended.
+
+### Reproduction
+
+The accompanying single-file PoC forks Ethereum mainnet and proves the bug against the live deployed contracts, two ways:
+
+- **Synthetic:** a fresh account locks YFI, earns, lets the lock fully expire (balance→0), withdraws, re-locks, and lets 3 reward weeks pass. It confirms the account *has* veYFI balance in those weeks and `tokens_per_week > 0`, yet `claim()` returns **0** and the cursor stays frozen at the expiry week.
+- **Real victim:** on unmodified mainnet state it shows `0x33333333…` holds 6.6 veYFI, its reward cursor is frozen ~1.75 years in the past, and `claim()` on its behalf returns **0**.
+
+Abridged output:
+```
+PART A — synthetic
+  A balance in last 3 weeks:   [0.481, 0.962, 1.442]
+  rewards available (tokens/wk): [1.67, 50.0, 50.0]
+  claim #3 (post-relock): 0.0000 ; claim #4: 0.0000
+  RESULT: PERMANENT FREEZE CONFIRMED
+PART B — real victim 0x33333333…
+  current veYFI balance: 6.61 ; reward cursor frozen at week: 1727913600
+  claim() on victim's behalf: 0.0000
+  RESULT: CONFIRMED
+```
+
+---
+
+## Impact Details
+
+**In-scope impact:** *Permanent freezing of unclaimed yield* (High). The frozen asset is users' earned-but-unclaimed rewards (dYFI in one pool, YFI penalties in the other); principal (YFI/veYFI) is unaffected and remains withdrawable — a yield-freeze, not a principal-freeze.
+
+**The trigger is normal, rational behaviour — not an edge case.** Letting a lock fully expire and then re-locking is the ordinary veYFI lifecycle:
+1. **The up-to-75% early-exit penalty pushes users to exit via natural expiry, not early withdrawal.** A rational holder who wants their YFI back does not pay the penalty; they wait for the lock to expire (0 penalty) and withdraw — so their veYFI balance necessarily passes through zero. If they later re-commit and create a new lock, they are immediately frozen.
+2. **Non-continuous participation is ordinary** — users routinely let a lock lapse (deliberately or by inattention over a multi-month lock) and re-enter later. Keeping an unbroken position requires actively *extending before expiry*; anyone who does not — the common case — hits a zero week. The on-chain victims are real users who did exactly this.
+
+Once triggered it is permanent and compounds every week the user holds veYFI.
+
+**Valuation (protocol-derived, live).** YFI/USD = **$2,186.92** (Chainlink). dYFI is a call option to buy 1 YFI at the redemption discount; intrinsic value = `YFI × discount`, with the redemption contract's live `discount()` = **71.5%**, giving **dYFI ≈ $1,564**.
+
+### Assets currently frozen / at risk (both pools)
+
+| Pool | Status | Held now | ≈ USD | Stuck cursors |
+|---|---|---|---|---|
+| dYFI `0x2391Fc` | actively funded (~0.195 dYFI/wk, ~$15.9k/yr) | 30.8249 dYFI | **$48,211** | 31 |
+| YFI `0xb287a1` (veYFI `reward_pool()`) | dormant funding, still holds penalties | 5.4286 YFI | **$11,875** | 21 |
+| **Combined exposure** | | | **≈ $60,086** | |
+
+- **dYFI pool — realized loss:** of the 31 stuck cursors, 3 re-locked afterwards and permanently lost rewards (the other 28 exited for good and hold no frozen assets). Total realized frozen: **1.948855 dYFI ≈ $3,048**:
+
+  | Address | Cursor frozen at | Current veYFI | Frozen dYFI | ≈ USD |
+  |---|---|---|---|---|
+  | `0x33333333d5efb92f19a5f94a43456b3cec2797ae` (Gnosis Safe) | 1727913600 | 6.61 | 1.934059 (active, growing) | $3,025 |
+  | `0x71694591730ef97fea19224ff9b5b48223136dd3` | 1705536000 | 0 | 0.007513 | $12 |
+  | `0x33398091bb758c083912f7f39484aa232fea593c` | 1711584000 | 0 | 0.007283 | $11 |
+
+- **YFI pool — same defect, same victims.** The YFI pool has 21 stuck cursors, including the *same* addresses (e.g., `0x33333333…` with 6.6 veYFI and `0xef52d4c1458b458bbfe73e3cab1031957bbe833b` with 0.59 veYFI). Its 5.43 YFI balance (~$11.9k) includes frozen shares that these users can never claim.
+
+- **Ongoing exposure:** the dYFI pool distributes ~$15.9k/yr; the share flowing to any expire→re-lock participant is frozen indefinitely. The population at risk is every current and future veYFI locker, and the frozen amount for a large position (including liquid-locker vaults) that ever lapses would be proportionally larger.
+
+The realized loss today is bounded because the penalty pools are small, but the defect is a permanent, unrecoverable, **compounding** leak across both pools and the dYFI stream, not a one-shot event.
+
+---
+
+## Prior disclosures & audit coverage (not a duplicate)
+
+This specific defect is not present in Yearn's public disclosures, and the two audits that reviewed this reward-pool code reported only adjacent, distinct issues:
+
+- **Public disclosures (`yearn/yearn-security`):** the only `FeeDistributor`-related entry is the 2021-02-18 yveCRV incident (an external account front-running a `3CRV` claim, causing fund mis-attribution) — unrelated to this cursor freeze.
+- **Statemind, "Yearn veYFI" (Jul 2022)** and **ChainSecurity, "Yearn veYFI and RewardPool" (Nov 2022)** both reviewed `RewardPool.vy`. Their reward-pool findings concern:
+  - the balance *calculation* not applying slope changes (ChainSecurity 6.7 / Statemind, `RewardPool.vy#L266`) — fixed by using `veYFI.balanceOf`; and
+  - the `_checkpoint_token`/claim **loop limits** leaving weeks unfilled or reverting on `ve_supply == 0` (ChainSecurity 6.9 / Statemind, `RewardPool.vy#L92`), where the cursor **advances** past those weeks.
+
+  Neither reports the `break`-on-zero-*balance* behaviour that traps the cursor when a lock expires and is re-created. That case has a different root cause (zero user balance vs. unfilled reward weeks), a different cursor behaviour (**frozen** vs. advancing), a different trigger (a normal expire→re-lock vs. a 40-week checkpoint gap), and a different scope (**all** future weeks vs. a few). The defect is present in the audited YFI pool (`0xb287a1`, deployed 2022-11-15) and the later dYFI pool (`0x2391Fc`, deployed 2023-10-17) alike, and deviates from the Curve upstream reference.
+
+---
+
+## Recommended fix
+
+Skip zero-balance weeks instead of breaking, matching Curve semantics:
+
+```vyper
+    balance_of: uint256 = VEYFI.balanceOf(addr, week_cursor)
+    if balance_of > 0:
+        to_distribute += balance_of * self.tokens_per_week[week_cursor] / self.ve_supply[week_cursor]
+    week_cursor += WEEK          # always advance; a zero week contributes nothing but is not terminal
+```
+
+The `range(50)` bound still caps gas per call — a user with a long expiry gap simply calls `claim()` more than once, as in Curve.
+
+**Note:** both deployed pools have **no owner, admin, upgrade path, or `sweep`** — every function is permissionless, and `time_cursor_of` is only ever written by `_claim`. The fix therefore **cannot be applied to the live contracts**; it requires **deploying new, corrected reward pools** and repointing the reward/penalty flow to them.
+
+---
+
+## Recovery of already-frozen funds
+
+**On-chain, the frozen rewards are unrecoverable — by anyone, including Yearn governance.** Verified by code analysis and empirically on a mainnet fork (accompanying recovery-test script). The freeze reduces to `veYFI.balanceOf(victim, stuck_week) == 0`, and nothing can change that or bypass it:
+
+1. **Historical veYFI balance is immutable.** `balanceOf(addr, ts)` for a past week is read from append-only point history (binary search for the point with `ts ≤ week`); a new deposit/lock only creates a point at `now > week`, which the lookup ignores. Tested: gifting **500,000 YFI** into the victim's lock left `balanceOf(victim, stuck_week)` at exactly `0`.
+2. **`time_cursor_of` cannot be reset.** It is written only inside `_claim`, only to `week_cursor` (which starts at the stuck value); the re-init branch requires it to equal `0`, which nothing can produce.
+3. **No admin / upgrade / `sweep`.** The only exit for rewards is `claim()`, the bricked path.
+4. **The frozen share is not claimable by anyone else.** Each user claims only their own `balanceOf(user,week)/ve_supply[week]` slice; the victim's slice simply remains in the contract balance forever.
+
+Fork test result (strongest attempts — a 500,000-YFI gift-deposit, new locks, repeated checkpoints, 20× claim): stuck-week balance stays `0`, cursor never moves, every claim returns `0`. The only remediation is governance-level and off-chain: deploy fixed pools for future users, and **compensate the affected addresses from the treasury** for the rewards already frozen. This immutability is why the impact is *permanent* freezing rather than temporary.
+
+---
+
+## References
+
+- Vulnerable code (identical `_claim` in both): dYFI Reward Pool `0x2391Fc8f5E417526338F5aa3968b1851C16D894E`; YFI Reward Pool `0xb287a1964aee422911c7b8409f5e5a273c1412fa` (Etherscan-verified sources).
+- Upstream reference: Curve `FeeDistributor` `_claim`, `0xA464e6DCda8AC41e03616F95f4BC98a13b8922Dc` (retains the `and user_epoch > max_user_epoch` guard these pools omit).
+- veYFI `0x90c1f9220d90d3966FbeE24045EDd73E1d588aD5` (`reward_pool()` = `0xb287a1…`, `balanceOf(address,uint256)`).
+- dYFI Redemption (discount / valuation) — `0x2fBa208E1B2106d40DaA472Cb7AE0c6C7EFc0224`; Chainlink YFI/USD — `0xA027702dbb89fbd58938e4324ac03B58d812b0E1`.
+- Audits reviewed: `yearn-security/audits/202207_Statemind_yearn-veyfi`, `.../202211_ChainSecurity_yearn-veYFI_and_RewardPool` (findings 6.7, 6.9 — adjacent, distinct).
+- A self-contained, fork-based Proof of Concept script accompanies this report.
